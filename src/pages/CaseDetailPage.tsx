@@ -11,24 +11,28 @@ import {
   Select,
   SimpleGrid,
   Stack,
+  Switch,
   Table,
   Tabs,
   Text,
   Textarea,
   TextInput,
   Title,
+  Tooltip,
 } from "@mantine/core";
-import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { useDisclosure } from "@mantine/hooks";
 import {
   ArrowLeft,
   Check,
   FilePlus2,
+  FlaskConical,
   GitBranchPlus,
   RotateCcw,
   Send,
+  Trash2,
 } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { useAppDispatch, useAppSelector } from "../app/hooks";
 import {
@@ -47,23 +51,35 @@ import {
   TransactionTimeline,
   type TimelineEvent,
 } from "../features/timeline/TransactionTimeline";
+import { ConflictResolutionModal } from "../features/snapshot/ConflictResolutionModal";
+import { EvidenceChangeSummary } from "../features/snapshot/EvidenceChangeSummary";
+import { PendingDraftsBanner } from "../features/snapshot/PendingDraftsBanner";
+import { SnapshotHistoryPanel } from "../features/snapshot/SnapshotHistoryPanel";
 import type {
   CaseDisposition,
+  Evidence,
   EvidenceStrength,
   NodeKind,
   RiskLevel,
 } from "../models/types";
+import type { FieldConflict } from "../models/snapshot";
 import {
+  deterministicId,
   useAddEvidenceMutation,
   useAddGraphNodeMutation,
-  useGetAlertsQuery,
+  useChangeEvidenceStrengthMutation,
   useGetCaseWorkspaceQuery,
+  useRemoveEvidenceMutation,
+  useRetryDraftCommitMutation,
   useReviewConclusionMutation,
   useSaveConclusionMutation,
+  useSetFailureSimulationMutation,
   useTransitionCaseMutation,
   useUpdateGraphNodeMutation,
+  useGetPendingDraftsQuery,
 } from "../services/api";
-import { createId, nowIso } from "../services/mockStorage";
+import { getSimulateFailure } from "../services/mockStorage";
+import type { CommitSnapshotSuccess, PendingDraft } from "../models/snapshot";
 
 const dispositionLabels: Record<CaseDisposition, string> = {
   freeze: "建议冻结",
@@ -71,12 +87,37 @@ const dispositionLabels: Record<CaseDisposition, string> = {
   observe: "继续观察",
 };
 
+const strengthOptions = [
+  { value: "strong", label: "强证据" },
+  { value: "medium", label: "中等证据" },
+  { value: "weak", label: "弱证据" },
+];
+
 const errorMessage = (error: unknown): string => {
   if (typeof error === "object" && error && "error" in error) {
     return String(error.error);
   }
   return "操作失败，请检查输入后重试。";
 };
+
+const isCommitError = (
+  error: unknown,
+): error is {
+  error: string;
+  conflicts?: FieldConflict[];
+  autoMerged?: number;
+  draftId?: string;
+} =>
+  typeof error === "object" &&
+  error !== null &&
+  "error" in error &&
+  typeof (error as { error?: unknown }).error === "string";
+
+interface ConflictState {
+  draftId: string;
+  conflicts: FieldConflict[];
+  autoMerged: number;
+}
 
 export function CaseDetailPage() {
   const { caseId = "" } = useParams();
@@ -92,27 +133,39 @@ export function CaseDetailPage() {
     (state) => state.alertsUi.focusedEvidenceId,
   );
   const { data, isLoading, error } = useGetCaseWorkspaceQuery(caseId);
-  const { data: allAlerts = [] } = useGetAlertsQuery({
-    keyword: "",
-    riskLevel: "all",
-    status: "all",
-    channel: "",
-  });
+  const { data: draftsOnOpen } = useGetPendingDraftsQuery(caseId);
+  // 只捕获打开案件那一刻已存在的草稿：之后新产生的冲突由当前操作的弹窗处理
+  const draftsAtMountRef = useRef<PendingDraft[] | null>(null);
+  if (draftsAtMountRef.current === null && draftsOnOpen) {
+    draftsAtMountRef.current = draftsOnOpen;
+  }
+  const draftsAtMount = draftsAtMountRef.current ?? [];
   const [addNode] = useAddGraphNodeMutation();
   const [updateNode] = useUpdateGraphNodeMutation();
   const [addEvidence, { isLoading: isAddingEvidence }] =
     useAddEvidenceMutation();
+  const [changeStrength] = useChangeEvidenceStrengthMutation();
+  const [removeEvidence] = useRemoveEvidenceMutation();
   const [saveConclusion, { isLoading: isSavingConclusion }] =
     useSaveConclusionMutation();
   const [transitionCase, { isLoading: isTransitioning }] =
     useTransitionCaseMutation();
   const [reviewConclusion, { isLoading: isReviewing }] =
     useReviewConclusionMutation();
+  const [retryCommit, { isLoading: isRetryingConflict }] =
+    useRetryDraftCommitMutation();
+  const [setFailureMode] = useSetFailureSimulationMutation();
+  const [failureSimOn, setFailureSimOn] = useState<boolean>(() =>
+    getSimulateFailure(),
+  );
 
   const [nodeOpened, nodeModal] = useDisclosure(false);
   const [evidenceOpened, evidenceModal] = useDisclosure(false);
   const [conclusionOpened, conclusionModal] = useDisclosure(false);
   const [reviewNote, setReviewNote] = useState("");
+  const [conflictState, setConflictState] = useState<ConflictState | null>(
+    null,
+  );
   const [nodeForm, setNodeForm] = useState({
     sourceId: "",
     kind: "account" as NodeKind,
@@ -140,6 +193,95 @@ export function CaseDetailPage() {
     riskControls: "",
   });
 
+  const latestConclusion = data?.conclusions[0];
+
+  const openConclusionModal = () => {
+    // 旧结论失效后新建版本：沿用处置建议与措施草稿，结论依据必须基于新证据重算
+    if (latestConclusion?.status === "invalidated") {
+      setConclusionForm({
+        disposition: latestConclusion.disposition,
+        rationale: "",
+        riskControls: latestConclusion.riskControls.join("\n"),
+      });
+    }
+    conclusionModal.open();
+  };
+
+  /** 保存成功后按版本摘要提示；冲突错误交给确认弹窗 */
+  const handleCommitOutcome = (
+    caught: unknown,
+    failTitle: string,
+  ): "conflict" | "failed" => {
+    if (isCommitError(caught) && caught.conflicts && caught.draftId) {
+      setConflictState({
+        draftId: caught.draftId,
+        conflicts: caught.conflicts,
+        autoMerged: caught.autoMerged ?? 0,
+      });
+      notifications.show({
+        color: "orange",
+        title: "与另一窗口的保存冲突",
+        message: "无冲突字段已自动合并，请确认冲突项后覆盖。",
+      });
+      return "conflict";
+    }
+    notifications.show({
+      color: "red",
+      title: failTitle,
+      message: errorMessage(caught),
+    });
+    return "failed";
+  };
+
+  const notifySnapshotSaved = (
+    result: CommitSnapshotSuccess,
+    title: string,
+  ): void => {
+    notifications.show({
+      color: "teal",
+      title: `${title} · 快照 V${result.revision}`,
+      message:
+        result.invalidatedConclusionIds.length > 0
+          ? `已保存并带版本摘要；${result.invalidatedConclusionIds.length} 份旧结论因证据变化失效，需要重算。`
+          : result.autoMerged > 0
+            ? `已保存；另一个窗口的 ${result.autoMerged} 项无冲突更新已自动合并。`
+            : "告警、案件、图谱、证据与结论已写入同一份可恢复快照。",
+    });
+  };
+
+  const resolveConflict = async (resolvedPaths: string[]) => {
+    if (!conflictState) {
+      return;
+    }
+    try {
+      const result = await retryCommit({
+        draftId: conflictState.draftId,
+        resolvedPaths,
+      }).unwrap();
+      setConflictState(null);
+      notifySnapshotSaved(result, "冲突已解决");
+    } catch (caught) {
+      if (isCommitError(caught) && caught.conflicts && caught.draftId) {
+        setConflictState({
+          draftId: caught.draftId,
+          conflicts: caught.conflicts,
+          autoMerged: caught.autoMerged ?? 0,
+        });
+        notifications.show({
+          color: "orange",
+          title: "仍有未解决的冲突项",
+          message: "另一窗口又有新的保存，请继续逐项确认。",
+        });
+      } else {
+        notifications.show({
+          color: "red",
+          title: "保存失败",
+          message: "草稿已保留，可稍后重试。",
+        });
+      }
+    }
+  };
+
   if (isLoading) {
     return <Text>正在加载案件工作区...</Text>;
   }
@@ -152,11 +294,11 @@ export function CaseDetailPage() {
     );
   }
 
-  const caseAlerts = allAlerts.filter((item) =>
-    data.case.alertIds.includes(item.id),
-  );
+  const caseAlerts = data.alerts;
   const selectedNode = data.nodes.find((item) => item.id === selectedNodeId);
-  const latestConclusion = data.conclusions[0];
+  const invalidatedConclusions = data.conclusions.filter(
+    (item) => item.status === "invalidated",
+  );
 
   const handleTimelineFocus = (event?: TimelineEvent) => {
     dispatch(focusTimeline(event?.id));
@@ -179,10 +321,10 @@ export function CaseDetailPage() {
       return;
     }
     try {
-      await addNode({
+      const result = await addNode({
         caseId,
         node: {
-          id: createId("NODE"),
+          id: deterministicId("NODE"),
           caseId,
           position: { x: 420, y: 240 },
           data: {
@@ -205,11 +347,7 @@ export function CaseDetailPage() {
           amount: nodeForm.amount || undefined,
         },
       }).unwrap();
-      notifications.show({
-        color: "teal",
-        title: "节点已加入",
-        message: "图谱、证据来源和审计日志已同步更新。",
-      });
+      notifySnapshotSaved(result, "节点已加入");
       nodeModal.close();
       setNodeForm((current) => ({
         ...current,
@@ -217,12 +355,8 @@ export function CaseDetailPage() {
         source: "",
         note: "",
       }));
-    } catch (mutationError) {
-      notifications.show({
-        color: "red",
-        title: "加入失败",
-        message: errorMessage(mutationError),
-      });
+    } catch (caught) {
+      handleCommitOutcome(caught, "加入失败");
     }
   };
 
@@ -240,7 +374,7 @@ export function CaseDetailPage() {
       return;
     }
     try {
-      await addEvidence({
+      const result = await addEvidence({
         caseId,
         title: evidenceForm.title.trim(),
         source: evidenceForm.source.trim(),
@@ -249,11 +383,7 @@ export function CaseDetailPage() {
         attachment: evidenceForm.attachment.trim(),
         note: evidenceForm.note.trim() || "未补充说明。",
       }).unwrap();
-      notifications.show({
-        color: "teal",
-        title: "证据已登记",
-        message: "证据来源、发生时间与提交时间已写入台账。",
-      });
+      notifySnapshotSaved(result, "证据已登记");
       evidenceModal.close();
       setEvidenceForm((current) => ({
         ...current,
@@ -262,12 +392,40 @@ export function CaseDetailPage() {
         attachment: "",
         note: "",
       }));
-    } catch (mutationError) {
-      notifications.show({
-        color: "red",
-        title: "证据登记失败",
-        message: errorMessage(mutationError),
-      });
+    } catch (caught) {
+      handleCommitOutcome(caught, "证据登记失败");
+    }
+  };
+
+  const handleStrengthChange = async (
+    evidence: Evidence,
+    strength: EvidenceStrength,
+  ) => {
+    if (strength === evidence.strength) {
+      return;
+    }
+    try {
+      const result = await changeStrength({
+        caseId,
+        evidenceId: evidence.id,
+        strength,
+      }).unwrap();
+      notifySnapshotSaved(result, "证据强度已调整");
+    } catch (caught) {
+      handleCommitOutcome(caught, "强度调整失败");
+    }
+  };
+
+  const handleRemoveEvidence = async (evidence: Evidence) => {
+    try {
+      const result = await removeEvidence({
+        caseId,
+        evidenceId: evidence.id,
+        evidenceTitle: evidence.title,
+      }).unwrap();
+      notifySnapshotSaved(result, "证据已移除");
+    } catch (caught) {
+      handleCommitOutcome(caught, "证据移除失败");
     }
   };
 
@@ -281,7 +439,7 @@ export function CaseDetailPage() {
       return;
     }
     try {
-      await saveConclusion({
+      const result = await saveConclusion({
         caseId,
         disposition: conclusionForm.disposition,
         rationale: conclusionForm.rationale.trim(),
@@ -291,23 +449,15 @@ export function CaseDetailPage() {
           .filter(Boolean),
         submit,
       }).unwrap();
-      notifications.show({
-        color: "teal",
-        title: submit ? "已提交复核" : "草稿已保存",
-        message: "结论版本已锁定创建人和创建时间。",
-      });
+      notifySnapshotSaved(result, submit ? "已提交复核" : "草稿已保存");
       conclusionModal.close();
       setConclusionForm({
         disposition: "observe",
         rationale: "",
         riskControls: "",
       });
-    } catch (mutationError) {
-      notifications.show({
-        color: "red",
-        title: "结论保存失败",
-        message: errorMessage(mutationError),
-      });
+    } catch (caught) {
+      handleCommitOutcome(caught, "结论保存失败");
     }
   };
 
@@ -315,23 +465,23 @@ export function CaseDetailPage() {
     status: "investigating" | "pending_review" | "supplement" | "closed",
   ) => {
     try {
-      await transitionCase({ caseId, status }).unwrap();
-      notifications.show({
-        color: "teal",
-        title: "状态已更新",
-        message: `案件状态已流转为 ${status}。`,
-      });
-    } catch (mutationError) {
-      notifications.show({
-        color: "red",
-        title: "状态流转失败",
-        message: errorMessage(mutationError),
-      });
+      const result = await transitionCase({ caseId, status }).unwrap();
+      notifySnapshotSaved(result, "状态已更新");
+    } catch (caught) {
+      handleCommitOutcome(caught, "状态流转失败");
     }
   };
 
   const handleReview = async (decision: "approve" | "return") => {
     if (!latestConclusion) {
+      return;
+    }
+    if (latestConclusion.status === "invalidated") {
+      notifications.show({
+        color: "red",
+        title: "该结论已失效",
+        message: "证据已发生变化，请先基于最新证据重算并提交新结论。",
+      });
       return;
     }
     if (reviewNote.trim().length < 6) {
@@ -343,25 +493,32 @@ export function CaseDetailPage() {
       return;
     }
     try {
-      await reviewConclusion({
+      const result = await reviewConclusion({
         caseId,
         conclusionId: latestConclusion.id,
         decision,
         reviewerNote: reviewNote.trim(),
       }).unwrap();
-      notifications.show({
-        color: decision === "approve" ? "teal" : "orange",
-        title: decision === "approve" ? "复核通过" : "已退回补证",
-        message: "复核动作和意见已写入审计日志。",
-      });
+      notifySnapshotSaved(
+        result,
+        decision === "approve" ? "复核通过" : "已退回补证",
+      );
       setReviewNote("");
-    } catch (mutationError) {
-      notifications.show({
-        color: "red",
-        title: "复核失败",
-        message: errorMessage(mutationError),
-      });
+    } catch (caught) {
+      handleCommitOutcome(caught, "复核失败");
     }
+  };
+
+  const toggleFailureSimulation = (enabled: boolean) => {
+    setFailureSimOn(enabled);
+    setFailureMode(enabled);
+    notifications.show({
+      color: enabled ? "orange" : "gray",
+      title: enabled ? "已开启保存失败模拟" : "已关闭保存失败模拟",
+      message: enabled
+        ? "之后的保存会失败并保留草稿，可在关闭后由横幅自动重试。"
+        : "保存恢复正常，待提交草稿将自动重试。",
+    });
   };
 
   return (
@@ -381,6 +538,11 @@ export function CaseDetailPage() {
               <Title order={2}>{data.case.title}</Title>
               <RiskBadge value={data.case.riskLevel} />
               <CaseStatusBadge value={data.case.status} />
+              <Tooltip label="告警、案件、图谱、证据、结论共用同一份快照版本">
+                <Badge variant="outline" color="grape">
+                  快照 V{data.revision}
+                </Badge>
+              </Tooltip>
             </Group>
             <Text c="dimmed" size="sm" mt={5}>
               {data.case.id} · 负责人 {data.case.owner} · 更新于{" "}
@@ -391,6 +553,22 @@ export function CaseDetailPage() {
           </div>
         </Group>
         <Group>
+          <Tooltip label="演示用：开启后所有保存会失败并保留草稿，用于验证重试流程">
+            <Switch
+              size="sm"
+              color="orange"
+              label={
+                <Group gap={4} wrap="nowrap">
+                  <FlaskConical size={14} />
+                  <Text size="xs">模拟保存失败</Text>
+                </Group>
+              }
+              checked={failureSimOn}
+              onChange={(event) =>
+                toggleFailureSimulation(event.currentTarget.checked)
+              }
+            />
+          </Tooltip>
           <Button
             variant="default"
             leftSection={<GitBranchPlus size={16} />}
@@ -407,12 +585,56 @@ export function CaseDetailPage() {
           </Button>
           <Button
             leftSection={<Send size={16} />}
-            onClick={conclusionModal.open}
+            onClick={openConclusionModal}
           >
             新建结论版本
           </Button>
         </Group>
       </Group>
+
+      <PendingDraftsBanner caseId={caseId} draftsAtMount={draftsAtMount} />
+
+      {invalidatedConclusions.length > 0 ? (
+        <Alert color="red" title="存在证据变化后失效的旧结论，需要重算">
+          <Stack gap="sm">
+            <Text size="sm">
+              证据台账已变化，以下结论的判断基线过期，不能继续沿用；可通过"新建结论版本"基于当前证据重新计算。
+              重启浏览器后这些失效版本依然可见。
+            </Text>
+            {invalidatedConclusions.map((item) => (
+              <Paper key={item.id} withBorder p="sm" bg="var(--mantine-color-red-0)">
+                <Group justify="space-between" mb={6}>
+                  <Group gap="xs">
+                    <Text size="sm" fw={700}>
+                      V{item.version}
+                    </Text>
+                    <ConclusionStatusBadge value={item.status} />
+                    <Text size="xs" c="dimmed">
+                      失效于{" "}
+                      {item.invalidatedAt
+                        ? new Date(item.invalidatedAt).toLocaleString("zh-CN", {
+                            hour12: false,
+                          })
+                        : "—"}
+                    </Text>
+                  </Group>
+                  <Button
+                    size="compact-xs"
+                    onClick={() => {
+                      openConclusionModal();
+                    }}
+                  >
+                    基于新证据重算
+                  </Button>
+                </Group>
+                {item.invalidation ? (
+                  <EvidenceChangeSummary changeSet={item.invalidation} compact />
+                ) : null}
+              </Paper>
+            ))}
+          </Stack>
+        </Alert>
+      ) : null}
 
       <Paper withBorder p="md">
         <Group justify="space-between">
@@ -469,6 +691,7 @@ export function CaseDetailPage() {
           <Tabs.Tab value="evidence">证据台账</Tabs.Tab>
           <Tabs.Tab value="conclusions">结论与复核</Tabs.Tab>
           <Tabs.Tab value="alerts">关联告警</Tabs.Tab>
+          <Tabs.Tab value="history">快照版本</Tabs.Tab>
         </Tabs.List>
 
         <Tabs.Panel value="graph" pt="md">
@@ -571,7 +794,7 @@ export function CaseDetailPage() {
               <div>
                 <Text fw={600}>证据台账</Text>
                 <Text size="sm" c="dimmed">
-                  每份证据记录来源、发生时间、提交时间和证据强度。
+                  每份证据记录来源、发生时间、提交时间和证据强度；新增、移除或调整强度都会令旧结论失效并进入快照版本摘要。
                 </Text>
               </div>
               <Button
@@ -581,7 +804,7 @@ export function CaseDetailPage() {
                 登记证据
               </Button>
             </Group>
-            <Table.ScrollContainer minWidth={980}>
+            <Table.ScrollContainer minWidth={1080}>
               <Table highlightOnHover verticalSpacing="sm">
                 <Table.Thead>
                   <Table.Tr>
@@ -592,6 +815,7 @@ export function CaseDetailPage() {
                     <Table.Th>提交记录</Table.Th>
                     <Table.Th>附件标识</Table.Th>
                     <Table.Th>说明</Table.Th>
+                    <Table.Th>操作</Table.Th>
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
@@ -614,7 +838,22 @@ export function CaseDetailPage() {
                       </Table.Td>
                       <Table.Td>{item.source}</Table.Td>
                       <Table.Td>
-                        <EvidenceStrengthBadge value={item.strength} />
+                        <Select
+                          size="xs"
+                          w={110}
+                          variant="unstyled"
+                          value={item.strength}
+                          data={strengthOptions}
+                          allowDeselect={false}
+                          onChange={(value) => {
+                            if (value) {
+                              void handleStrengthChange(
+                                item,
+                                value as EvidenceStrength,
+                              );
+                            }
+                          }}
+                        />
                       </Table.Td>
                       <Table.Td>
                         {new Date(item.occurredAt).toLocaleString("zh-CN", {
@@ -636,10 +875,23 @@ export function CaseDetailPage() {
                           {item.attachment}
                         </Text>
                       </Table.Td>
-                      <Table.Td maw={300}>
+                      <Table.Td maw={260}>
                         <Text size="xs" c="dimmed">
                           {item.note}
                         </Text>
+                      </Table.Td>
+                      <Table.Td>
+                        <Tooltip label="移除后旧结论将失效，可通过快照恢复">
+                          <Button
+                            size="compact-xs"
+                            variant="subtle"
+                            color="red"
+                            leftSection={<Trash2 size={13} />}
+                            onClick={() => void handleRemoveEvidence(item)}
+                          >
+                            移除
+                          </Button>
+                        </Tooltip>
                       </Table.Td>
                     </Table.Tr>
                   ))}
@@ -657,10 +909,10 @@ export function CaseDetailPage() {
                   <div>
                     <Text fw={600}>结论版本</Text>
                     <Text size="sm" c="dimmed">
-                      已通过的版本不可被覆盖，后续修改将产生新版本。
+                      证据变化后旧结论自动失效并列出差异；已通过版本不可覆盖，任何修改都产生新版本。
                     </Text>
                   </div>
-                  <Button onClick={conclusionModal.open}>新建版本</Button>
+                  <Button onClick={openConclusionModal}>新建版本</Button>
                 </Group>
                 <Stack gap={0}>
                   {data.conclusions.map((item, index) => (
@@ -674,6 +926,9 @@ export function CaseDetailPage() {
                             <Badge variant="light" color="gray">
                               {dispositionLabels[item.disposition]}
                             </Badge>
+                            <Text size="xs" c="dimmed" ff="monospace">
+                              基于快照 V{item.baseRevision}
+                            </Text>
                           </Group>
                           <Text size="xs" c="dimmed">
                             {item.createdBy} ·{" "}
@@ -682,7 +937,27 @@ export function CaseDetailPage() {
                             })}
                           </Text>
                         </Group>
-                        <Text size="sm">{item.rationale}</Text>
+                        {item.status === "invalidated" ? (
+                          <Alert color="red" title="证据变化，该结论已失效，请重算">
+                            {item.invalidation ? (
+                              <EvidenceChangeSummary
+                                changeSet={item.invalidation}
+                                compact
+                              />
+                            ) : null}
+                          </Alert>
+                        ) : null}
+                        <Text
+                          size="sm"
+                          td={
+                            item.status === "invalidated" ? "line-through" : undefined
+                          }
+                          c={
+                            item.status === "invalidated" ? "dimmed" : undefined
+                          }
+                        >
+                          {item.rationale}
+                        </Text>
                         <Group gap="xs">
                           {item.riskControls.map((control) => (
                             <Badge key={control} variant="outline" color="gray">
@@ -715,42 +990,50 @@ export function CaseDetailPage() {
                       当前版本 V{latestConclusion.version} ·{" "}
                       {dispositionLabels[latestConclusion.disposition]}
                     </Text>
-                    <Alert
-                      color="orange"
-                      icon={<RotateCcw size={16} />}
-                      mt="md"
-                    >
-                      关系关联不能直接作为结论。通过前应检查证据来源、发生时间与证据强度。
-                    </Alert>
-                    <Textarea
-                      label="复核意见"
-                      description="通过或退回意见均进入不可删除的审计记录"
-                      minRows={4}
-                      mt="md"
-                      value={reviewNote}
-                      onChange={(event) =>
-                        setReviewNote(event.currentTarget.value)
-                      }
-                    />
-                    <Group mt="md">
-                      <Button
-                        leftSection={<Check size={16} />}
-                        color="teal"
-                        loading={isReviewing}
-                        onClick={() => handleReview("approve")}
-                      >
-                        复核通过
-                      </Button>
-                      <Button
-                        variant="light"
-                        color="orange"
-                        leftSection={<RotateCcw size={16} />}
-                        loading={isReviewing}
-                        onClick={() => handleReview("return")}
-                      >
-                        退回补证
-                      </Button>
-                    </Group>
+                    {latestConclusion.status === "invalidated" ? (
+                      <Alert color="red" mt="md">
+                        当前最新结论已因证据变化失效，不能复核或沿用。请先基于新增/移除/强度变化后的证据重算并提交新版本。
+                      </Alert>
+                    ) : (
+                      <>
+                        <Alert
+                          color="orange"
+                          icon={<RotateCcw size={16} />}
+                          mt="md"
+                        >
+                          关系关联不能直接作为结论。通过前应检查证据来源、发生时间与证据强度。
+                        </Alert>
+                        <Textarea
+                          label="复核意见"
+                          description="通过或退回意见均进入不可删除的审计记录"
+                          minRows={4}
+                          mt="md"
+                          value={reviewNote}
+                          onChange={(event) =>
+                            setReviewNote(event.currentTarget.value)
+                          }
+                        />
+                        <Group mt="md">
+                          <Button
+                            leftSection={<Check size={16} />}
+                            color="teal"
+                            loading={isReviewing}
+                            onClick={() => handleReview("approve")}
+                          >
+                            复核通过
+                          </Button>
+                          <Button
+                            variant="light"
+                            color="orange"
+                            leftSection={<RotateCcw size={16} />}
+                            loading={isReviewing}
+                            onClick={() => handleReview("return")}
+                          >
+                            退回补证
+                          </Button>
+                        </Group>
+                      </>
+                    )}
                   </>
                 ) : (
                   <Text c="dimmed" mt="md">
@@ -797,6 +1080,14 @@ export function CaseDetailPage() {
               </Table>
             </Table.ScrollContainer>
           </Paper>
+        </Tabs.Panel>
+
+        <Tabs.Panel value="history" pt="md">
+          <SnapshotHistoryPanel
+            caseId={caseId}
+            currentRevision={data.revision}
+            history={data.history}
+          />
         </Tabs.Panel>
       </Tabs>
 
@@ -886,11 +1177,7 @@ export function CaseDetailPage() {
                   (value as EvidenceStrength) ?? "medium",
               }))
             }
-            data={[
-              { value: "strong", label: "强" },
-              { value: "medium", label: "中" },
-              { value: "weak", label: "弱" },
-            ]}
+            data={strengthOptions}
           />
           <TextInput
             type="datetime-local"
@@ -996,11 +1283,7 @@ export function CaseDetailPage() {
                 strength: (value as EvidenceStrength) ?? "medium",
               }))
             }
-            data={[
-              { value: "strong", label: "强证据" },
-              { value: "medium", label: "中等证据" },
-              { value: "weak", label: "弱证据" },
-            ]}
+            data={strengthOptions}
           />
           <TextInput
             type="datetime-local"
@@ -1054,6 +1337,11 @@ export function CaseDetailPage() {
         title="新建结论版本"
         size="lg"
       >
+        {latestConclusion?.status === "invalidated" ? (
+          <Alert color="red" mb="md">
+            上一版结论依据的证据已变化。处置建议和风控措施已预填，但结论依据必须结合下方差异重新撰写，不得沿用旧结论。
+          </Alert>
+        ) : null}
         <Select
           label="处置建议"
           value={conclusionForm.disposition}
@@ -1096,7 +1384,7 @@ export function CaseDetailPage() {
           }
         />
         <Alert color="gray" mt="md">
-          保存草稿不会触发复核；提交后生成独立版本并进入待复核状态。
+          保存草稿不会触发复核；提交后生成独立版本并进入待复核状态。新版本会锁定当前证据指纹，证据再变化时自动失效。
         </Alert>
         <Group justify="flex-end" mt="lg">
           <Button variant="default" onClick={conclusionModal.close}>
@@ -1117,6 +1405,15 @@ export function CaseDetailPage() {
           </Button>
         </Group>
       </Modal>
+
+      <ConflictResolutionModal
+        opened={conflictState !== null}
+        conflicts={conflictState?.conflicts ?? []}
+        autoMergedCount={conflictState?.autoMerged ?? 0}
+        submitting={isRetryingConflict}
+        onClose={() => setConflictState(null)}
+        onResolve={resolveConflict}
+      />
     </Stack>
   );
 }

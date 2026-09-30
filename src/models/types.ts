@@ -13,7 +13,17 @@ export type ConclusionStatus =
   | "draft"
   | "submitted"
   | "approved"
-  | "returned";
+  | "returned"
+  | "invalidated";
+
+export type SnapshotSaveKind =
+  | "graph"
+  | "evidence"
+  | "conclusion"
+  | "alerts"
+  | "case"
+  | "review"
+  | "restore";
 
 export interface Alert {
   id: string;
@@ -87,6 +97,31 @@ export interface ConclusionVersion {
   createdAt: string;
   reviewer: string;
   reviewerNote?: string;
+  /** 结论创建时所依据的证据指纹；证据变化后据此判定失效 */
+  evidenceFingerprint: EvidenceFingerprintItem[];
+  /** 快照版本号：该结论基于哪一版案件快照产生 */
+  baseRevision: number;
+  invalidatedAt?: string;
+  invalidation?: EvidenceChangeSet;
+}
+
+export interface EvidenceFingerprintItem {
+  id: string;
+  title: string;
+  strength: EvidenceStrength;
+  version: number;
+}
+
+/** 证据台账相对结论基线的变化清单，用于旧结论失效与重算提示 */
+export interface EvidenceChangeSet {
+  added: EvidenceFingerprintItem[];
+  removed: EvidenceFingerprintItem[];
+  changed: Array<{
+    id: string;
+    title: string;
+    before: EvidenceStrength;
+    after: EvidenceStrength;
+  }>;
 }
 
 export interface InvestigationCase {

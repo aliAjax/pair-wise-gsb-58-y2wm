@@ -81,7 +81,7 @@ export function AlertsPage() {
       notifications.show({
         color: "teal",
         title: "关联完成",
-        message: `${result.length} 条告警已加入 ${caseTargetId}。`,
+        message: `${result.summary.stats.alertsLinked} 条告警已随快照保存并加入 ${caseTargetId}（快照 V${result.revision}）。`,
       });
       dispatch(setAlertSelection([]));
     } catch (error) {

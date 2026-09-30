@@ -398,6 +398,12 @@ export const seedConclusions: ConclusionVersion[] = [
     createdBy: "林澜",
     createdAt: "2026-09-29T08:20:00+08:00",
     reviewer: "赵平",
+    evidenceFingerprint: [
+      { id: "EV-017-001", title: "交易明细提取单", strength: "strong", version: 1 },
+      { id: "EV-017-002", title: "设备指纹登录日志", strength: "strong", version: 2 },
+      { id: "EV-017-003", title: "收款商户登记材料", strength: "medium", version: 1 },
+    ],
+    baseRevision: 1,
   },
   {
     id: "CV-016-001",
@@ -410,6 +416,8 @@ export const seedConclusions: ConclusionVersion[] = [
     createdBy: "周明",
     createdAt: "2026-09-29T07:55:00+08:00",
     reviewer: "赵平",
+    evidenceFingerprint: [],
+    baseRevision: 1,
   },
   {
     id: "CV-015-001",
@@ -423,6 +431,15 @@ export const seedConclusions: ConclusionVersion[] = [
     createdAt: "2026-09-28T19:20:00+08:00",
     reviewer: "赵平",
     reviewerNote: "补充商户合同与付款用途后再提交，不得以关联代替结论。",
+    evidenceFingerprint: [
+      {
+        id: "EV-015-001",
+        title: "跨案受益关系导出",
+        strength: "medium",
+        version: 1,
+      },
+    ],
+    baseRevision: 1,
   },
 ];
 

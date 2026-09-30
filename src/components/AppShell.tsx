@@ -1,6 +1,7 @@
 import {
   AppShell as MantineAppShell,
   Box,
+  Badge,
   Group,
   NavLink,
   Stack,
@@ -10,12 +11,14 @@ import {
 } from "@mantine/core";
 import {
   AlertTriangle,
+  CloudOff,
   FileSearch,
   FolderSearch2,
   LayoutDashboard,
   ShieldCheck,
 } from "lucide-react";
-import { NavLink as RouterNavLink, Outlet, useLocation } from "react-router-dom";
+import { NavLink as RouterNavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { useGetPendingDraftsQuery } from "../services/api";
 
 const navigation = [
   {
@@ -46,6 +49,8 @@ const navigation = [
 
 export function AppShell() {
   const location = useLocation();
+  const navigate = useNavigate();
+  const { data: pendingDrafts = [] } = useGetPendingDraftsQuery();
 
   return (
     <MantineAppShell
@@ -68,6 +73,19 @@ export function AppShell() {
             </Box>
           </Group>
           <Group gap="xs" visibleFrom="md">
+            {pendingDrafts.length > 0 ? (
+              <Badge
+                color="red"
+                variant="light"
+                style={{ cursor: "pointer" }}
+                leftSection={<CloudOff size={13} />}
+                onClick={() =>
+                  navigate(`/cases/${pendingDrafts[0].caseId}`)
+                }
+              >
+                {pendingDrafts.length} 份保存草稿待重试
+              </Badge>
+            ) : null}
             <Text size="sm" c="dimmed">
               当前角色
             </Text>

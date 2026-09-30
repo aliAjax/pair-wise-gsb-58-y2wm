@@ -136,7 +136,7 @@ export const seedAlerts: Alert[] = [
   },
 ];
 
-export const seedCases: InvestigationCase[] = [
+export const seedCases: Omit<InvestigationCase, "revision">[] = [
   {
     id: "CASE-2026-017",
     title: "东江路账户群资金往返案",

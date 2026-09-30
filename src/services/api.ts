@@ -4,13 +4,17 @@ import type {
   AlertFilters,
   AuditLog,
   CaseDisposition,
+  CaseSnapshot,
   CaseStatus,
   ConclusionVersion,
   DashboardSummary,
   Evidence,
   InvestigationCase,
   InvestigationNode,
+  PendingDraft,
   RiskLevel,
+  SaveWorkspaceInput,
+  WorkspaceConflict,
 } from "../models/types";
 import {
   appendAudit,
@@ -20,6 +24,13 @@ import {
   resetDatabase,
   writeDatabase,
 } from "./mockStorage";
+import {
+  advanceSnapshot,
+  commitWorkspace,
+  restoreSnapshot,
+  type ConflictError,
+} from "./snapshotService";
+import { listPendingDrafts, removePendingDraft } from "./pendingDrafts";
 
 const wait = (milliseconds = 260) =>
   new Promise((resolve) => window.setTimeout(resolve, milliseconds));
@@ -39,7 +50,15 @@ export interface AddNodeInput {
 export const bankApi = createApi({
   reducerPath: "bankApi",
   baseQuery: fakeBaseQuery(),
-  tagTypes: ["Alerts", "Cases", "Case", "Audit", "Dashboard"],
+  tagTypes: [
+    "Alerts",
+    "Cases",
+    "Case",
+    "Audit",
+    "Dashboard",
+    "Snapshots",
+    "Drafts",
+  ],
   endpoints: (builder) => ({
     getDashboard: builder.query<DashboardSummary, void>({
       queryFn: async () => {
@@ -136,6 +155,8 @@ export const bankApi = createApi({
         edges: ReturnType<typeof readDatabase>["edges"];
         evidence: Evidence[];
         conclusions: ConclusionVersion[];
+        snapshots: CaseSnapshot[];
+        pendingDraft?: PendingDraft;
       },
       string
     >({
@@ -159,12 +180,39 @@ export const bankApi = createApi({
             conclusions: database.conclusions
               .filter((item) => item.caseId === caseId)
               .sort((a, b) => b.version - a.version),
+            snapshots: database.snapshots
+              .filter((item) => item.caseId === caseId)
+              .sort((a, b) => b.revision - a.revision),
+            pendingDraft: listPendingDrafts().find(
+              (item) => item.caseId === caseId,
+            ),
           },
         };
       },
       providesTags: (_result, _error, caseId) => [
         { type: "Case", id: caseId },
+        { type: "Snapshots", id: caseId },
+        { type: "Drafts", id: caseId },
         "Dashboard",
+      ],
+    }),
+    getPendingDrafts: builder.query<PendingDraft[], void>({
+      queryFn: async () => {
+        await wait(120);
+        return { data: listPendingDrafts() };
+      },
+      providesTags: ["Drafts"],
+    }),
+    getCaseSnapshots: builder.query<CaseSnapshot[], string>({
+      queryFn: async (caseId) => {
+        await wait(120);
+        const snapshots = readDatabase()
+          .snapshots.filter((item) => item.caseId === caseId)
+          .sort((a, b) => b.revision - a.revision);
+        return { data: snapshots };
+      },
+      providesTags: (_result, _error, caseId) => [
+        { type: "Snapshots", id: caseId },
       ],
     }),
     getAuditLogs: builder.query<AuditLog[], void>({
@@ -190,22 +238,23 @@ export const bankApi = createApi({
             ? { ...item, caseId, status: "linked" as const }
             : item,
         );
-        const selected = updated.filter((item) => alertIds.includes(item.id));
+        database.alerts = updated;
         targetCase.alertIds = Array.from(
           new Set([...targetCase.alertIds, ...alertIds]),
         );
-        targetCase.updatedAt = nowIso();
-        database.alerts = updated;
-        appendAudit(database, {
-          caseId,
+        writeDatabase(database);
+        advanceSnapshot(database, caseId, {
           actor: "林澜",
-          action: "批量关联告警",
-          detail: `关联告警 ${alertIds.join("、")}。`,
+          source: "批量关联告警",
+          note: `关联告警 ${alertIds.join("、")}`,
         });
         writeDatabase(database);
+        const selected = database.alerts.filter((item) =>
+          alertIds.includes(item.id),
+        );
         return { data: selected };
       },
-      invalidatesTags: ["Alerts", "Cases", "Audit", "Dashboard"],
+      invalidatesTags: ["Alerts", "Cases", "Audit", "Dashboard", "Snapshots"],
     }),
     updateAlertStatus: builder.mutation<
       Alert,
@@ -258,17 +307,18 @@ export const bankApi = createApi({
         if (targetCase) {
           targetCase.updatedAt = nowIso();
         }
-        appendAudit(database, {
-          caseId,
+        writeDatabase(database);
+        advanceSnapshot(database, caseId, {
           actor: "林澜",
-          action: "加入图谱节点",
-          detail: `${node.data.label} 已加入，证据强度 ${node.data.evidenceStrength}。`,
+          source: "加入图谱节点",
+          note: `${node.data.label} 加入，证据强度 ${node.data.evidenceStrength}${relation ? `，并登记关系“${relation.label}”` : ""}`,
         });
         writeDatabase(database);
         return { data: node };
       },
       invalidatesTags: (_result, _error, input) => [
         { type: "Case", id: input.caseId },
+        { type: "Snapshots", id: input.caseId },
         "Audit",
         "Dashboard",
       ],
@@ -313,17 +363,18 @@ export const bankApi = createApi({
         if (targetCase) {
           targetCase.updatedAt = nowIso();
         }
-        appendAudit(database, {
-          caseId: input.caseId,
+        writeDatabase(database);
+        advanceSnapshot(database, input.caseId, {
           actor: "林澜",
-          action: "新增证据",
-          detail: `${input.title} 已登记，来源为 ${input.source}。`,
+          source: "新增证据",
+          note: `${input.title} 已登记，来源为 ${input.source}，证据强度 ${input.strength}`,
         });
         writeDatabase(database);
         return { data: evidence };
       },
       invalidatesTags: (_result, _error, input) => [
         { type: "Case", id: input.caseId },
+        { type: "Snapshots", id: input.caseId },
         "Audit",
         "Dashboard",
       ],
@@ -341,7 +392,13 @@ export const bankApi = createApi({
       queryFn: async (input) => {
         await wait();
         const database = readDatabase();
+        if (!database.cases.some((item) => item.id === input.caseId)) {
+          return { error: { status: "CUSTOM_ERROR", error: "案件不存在" } };
+        }
         const existing = database.conclusions.filter(
+          (item) => item.caseId === input.caseId,
+        );
+        const caseEvidence = database.evidence.filter(
           (item) => item.caseId === input.caseId,
         );
         const conclusion: ConclusionVersion = {
@@ -356,6 +413,9 @@ export const bankApi = createApi({
           createdBy: "林澜",
           createdAt: nowIso(),
           reviewer: "赵平",
+          evidenceSignature: caseEvidence.map(
+            (item) => `${item.id}|${item.title}|${item.source}|${item.strength}|${item.occurredAt}|${item.attachment}`,
+          ).sort((a, b) => a.localeCompare(b)),
         };
         database.conclusions.unshift(conclusion);
         const targetCase = database.cases.find(
@@ -363,19 +423,22 @@ export const bankApi = createApi({
         );
         if (targetCase) {
           targetCase.status = input.submit ? "pending_review" : "investigating";
-          targetCase.updatedAt = nowIso();
         }
-        appendAudit(database, {
-          caseId: input.caseId,
+        writeDatabase(database);
+        advanceSnapshot(database, input.caseId, {
           actor: "林澜",
-          action: "保存结论版本",
-          detail: `${conclusion.id} V${conclusion.version} 已${input.submit ? "提交复核" : "保存为草稿"}。`,
+          source: "保存结论版本",
+          note: `${conclusion.id} V${conclusion.version} 已${input.submit ? "提交复核" : "保存为草稿"}`,
         });
         writeDatabase(database);
-        return { data: conclusion };
+        const saved = database.conclusions.find(
+          (item) => item.id === conclusion.id,
+        );
+        return { data: saved ?? conclusion };
       },
       invalidatesTags: (_result, _error, input) => [
         { type: "Case", id: input.caseId },
+        { type: "Snapshots", id: input.caseId },
         "Audit",
         "Cases",
         "Dashboard",
@@ -407,18 +470,18 @@ export const bankApi = createApi({
           }
         }
         targetCase.status = status;
-        targetCase.updatedAt = nowIso();
-        appendAudit(database, {
-          caseId,
+        writeDatabase(database);
+        advanceSnapshot(database, caseId, {
           actor: "林澜",
-          action: "案件状态流转",
-          detail: `状态更新为 ${status}${reason ? `，原因：${reason}` : ""}。`,
+          source: "案件状态流转",
+          note: `状态更新为 ${status}${reason ? `，原因：${reason}` : ""}`,
         });
         writeDatabase(database);
         return { data: targetCase };
       },
       invalidatesTags: (_result, _error, input) => [
         { type: "Case", id: input.caseId },
+        { type: "Snapshots", id: input.caseId },
         "Cases",
         "Audit",
         "Dashboard",
@@ -449,7 +512,10 @@ export const bankApi = createApi({
           return {
             error: {
               status: "CUSTOM_ERROR",
-              error: "当前版本不能再次复核。",
+              error:
+                conclusion.status === "invalidated"
+                  ? "该版本已因证据变化失效，请基于最新证据重算后再提交复核。"
+                  : "当前版本不能再次复核。",
             },
           };
         }
@@ -459,31 +525,137 @@ export const bankApi = createApi({
         if (targetCase) {
           targetCase.status =
             decision === "approve" ? "closed" : "supplement";
-          targetCase.updatedAt = nowIso();
         }
-        appendAudit(database, {
-          caseId,
+        writeDatabase(database);
+        advanceSnapshot(database, caseId, {
           actor: "赵平",
-          action: decision === "approve" ? "复核通过" : "退回补证",
-          detail: `${conclusion.id} 已${decision === "approve" ? "通过" : "退回"}。${reviewerNote}`,
+          source: decision === "approve" ? "复核通过" : "退回补证",
+          note: `${conclusion.id} 已${decision === "approve" ? "通过" : "退回"}：${reviewerNote}`,
         });
         writeDatabase(database);
         return { data: conclusion };
       },
       invalidatesTags: (_result, _error, input) => [
         { type: "Case", id: input.caseId },
+        { type: "Snapshots", id: input.caseId },
         "Cases",
         "Audit",
         "Dashboard",
+      ],
+    }),
+    saveWorkspace: builder.mutation<
+      {
+        bundle: SaveWorkspaceInput["bundle"];
+        snapshot: CaseSnapshot;
+        autoMerged: WorkspaceConflict[];
+      },
+      SaveWorkspaceInput
+    >({
+      queryFn: async (input) => {
+        await wait(420);
+        if (input.simulateFailure) {
+          return {
+            error: {
+              status: "CUSTOM_ERROR",
+              error: "保存失败（模拟网络中断）：草稿已保留，将在下次打开时重试。",
+            },
+          };
+        }
+        const database = readDatabase();
+        if (!database.cases.some((item) => item.id === input.caseId)) {
+          return { error: { status: "CUSTOM_ERROR", error: "案件不存在" } };
+        }
+        const result = commitWorkspace(database, input);
+        if ((result as ConflictError).status === "CONFLICT") {
+          const conflict = result as ConflictError;
+          return {
+            error: {
+              status: "CONFLICT",
+              error: "检测到另一个窗口的并发修改，存在字段冲突。",
+              data: conflict,
+            },
+          };
+        }
+        writeDatabase(database);
+        const success = result as {
+          bundle: SaveWorkspaceInput["bundle"];
+          snapshot: CaseSnapshot;
+          autoMerged: WorkspaceConflict[];
+        };
+        return { data: success };
+      },
+      invalidatesTags: (_result, _error, input) => [
+        { type: "Case", id: input.caseId },
+        { type: "Snapshots", id: input.caseId },
+        { type: "Drafts", id: input.caseId },
+        "Audit",
+        "Cases",
+        "Dashboard",
+        "Alerts",
+      ],
+    }),
+    restoreCaseSnapshot: builder.mutation<
+      { bundle: SaveWorkspaceInput["bundle"]; snapshot: CaseSnapshot },
+      { caseId: string; snapshotId: string }
+    >({
+      queryFn: async ({ caseId, snapshotId }) => {
+        await wait(360);
+        const database = readDatabase();
+        try {
+          const result = restoreSnapshot(database, caseId, snapshotId, "林澜");
+          writeDatabase(database);
+          return {
+            data: { bundle: result.bundle, snapshot: result.snapshot },
+          };
+        } catch (caught) {
+          return {
+            error: {
+              status: "CUSTOM_ERROR",
+              error: caught instanceof Error ? caught.message : "恢复失败",
+            },
+          };
+        }
+      },
+      invalidatesTags: (_result, _error, input) => [
+        { type: "Case", id: input.caseId },
+        { type: "Snapshots", id: input.caseId },
+        "Audit",
+        "Cases",
+        "Dashboard",
+        "Alerts",
+      ],
+    }),
+    discardPendingDraft: builder.mutation<{ ok: boolean }, string>({
+      queryFn: async (caseId) => {
+        await wait(120);
+        removePendingDraft(caseId);
+        return { data: { ok: true } };
+      },
+      invalidatesTags: (_result, _error, caseId) => [
+        { type: "Drafts", id: caseId },
+        { type: "Case", id: caseId },
       ],
     }),
     resetMockData: builder.mutation<{ ok: boolean }, void>({
       queryFn: async () => {
         await wait(180);
         resetDatabase();
+        if (typeof window !== "undefined") {
+          Object.keys(window.localStorage)
+            .filter((key) => key.includes("pending-drafts"))
+            .forEach((key) => window.localStorage.removeItem(key));
+        }
         return { data: { ok: true } };
       },
-      invalidatesTags: ["Alerts", "Cases", "Case", "Audit", "Dashboard"],
+      invalidatesTags: [
+        "Alerts",
+        "Cases",
+        "Case",
+        "Audit",
+        "Dashboard",
+        "Snapshots",
+        "Drafts",
+      ],
     }),
   }),
 });
@@ -491,15 +663,20 @@ export const bankApi = createApi({
 export const {
   useAddEvidenceMutation,
   useAddGraphNodeMutation,
+  useDiscardPendingDraftMutation,
   useGetAlertsQuery,
   useGetAuditLogsQuery,
+  useGetCaseSnapshotsQuery,
   useGetCaseWorkspaceQuery,
   useGetCasesQuery,
   useGetDashboardQuery,
+  useGetPendingDraftsQuery,
   useLinkAlertsToCaseMutation,
   useResetMockDataMutation,
+  useRestoreCaseSnapshotMutation,
   useReviewConclusionMutation,
   useSaveConclusionMutation,
+  useSaveWorkspaceMutation,
   useTransitionCaseMutation,
   useUpdateAlertStatusMutation,
   useUpdateGraphNodeMutation,
